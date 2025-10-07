@@ -1,0 +1,86 @@
+name: Build and Deploy to AKS
+
+on:
+  push:
+    branches: [ "main", "master" ]   # change branch as needed
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP: SuiteDoctor-dev
+  AKS_CLUSTER: Suitedoctor-ai-dev
+  ACR_NAME: sddevacr
+  IMAGE_NAME: helloworld
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get ACR login server
+        id: acr
+        run: |
+          ACR_LOGIN_SERVER=$(az acr show -n ${{ env.ACR_NAME }} --query loginServer -o tsv)
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_ENV
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to ACR
+        run: |
+          az acr login -n ${{ env.ACR_NAME }}
+
+      - name: Build and push image to ACR
+        uses: docker/build-push-action@v4
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Set IMAGE variable
+        run: |
+          IMAGE=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Update k8s/deployment.yaml image placeholder
+        run: |
+          sed -i "s|REPLACE_IMAGE|${IMAGE}|g" k8s/deployment.yaml
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_CLUSTER }} --overwrite-existing
+
+      - name: Deploy to AKS
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/helloworld --timeout=120s
+
+      - name: Wait for External IP and print endpoint
+        run: |
+          echo "Waiting for external IP..."
+          for i in {1..30}; do
+            EXTERNAL_IP=$(kubectl get svc helloworld --template="{{range .status.loadBalancer.ingress}}{{.ip}}{{end}}")
+            if [ -n "$EXTERNAL_IP" ]; then
+              echo "External IP: $EXTERNAL_IP"
+              echo "URL: http://$EXTERNAL_IP"
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$EXTERNAL_IP" ]; then
+            echo "No external IP assigned yet. Check Azure portal or kubectl get svc helloworld -n default"
+            exit 1
+          fi
